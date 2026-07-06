@@ -1,0 +1,9 @@
+# Camera Map – Python Dependencies
+# Install all dependencies with:
+#   python -m pip install -r requirements.txt
+
+opencv-python>=4.8.0   # Camera capture and frame processing
+Pillow>=10.0.0         # Image conversion for Tkinter display
+numpy>=1.24.0          # Array handling (installed automatically with opencv-python)
+
+# Note: tkinter is bundled with Python 3 and does not need to be installed separately.
