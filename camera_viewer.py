@@ -45,35 +45,35 @@ TOTAL_W = PANEL_W * 2   # card canvas spans both panels
 
 def _try_open(index: int) -> cv2.VideoCapture | None:
     """
-    Try every backend in order and return the first VideoCapture that
-    successfully reads a frame.  The capture is left OPEN so the caller
-    can hand it directly to CameraFeed without re-opening.
-
-    Forces MJPEG compression + target resolution before any reads to
-    keep USB bandwidth low enough for 3 simultaneous cameras.
+    Try backends in order and return the first VideoCapture that
+    successfully reads a frame.  Avoids forcing MJPEG/resolution hints
+    that cause MSMF streaming failures on many webcams.
     """
-    backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+    # CAP_DSHOW first (most stable on Windows for multiple webcams),
+    # then MSMF and ANY
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
     for backend in backends:
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
             cap.release()
             continue
 
-        # ── Reduce USB bandwidth: MJPEG instead of raw YUV ──────────────
-        cap.set(cv2.CAP_PROP_FOURCC,
-                cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        # Request a moderate resolution — let the driver pick the format
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  PANEL_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, PANEL_H)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        # ────────────────────────────────────────────────────────────────
 
-        # Warm up: drain frames so the sensor stabilises after mode change
-        for _ in range(15):
-            cap.read()
-        ret, _ = cap.read()
-        if ret:
+        # Warm-up: give the sensor time to start streaming
+        ok = False
+        for _ in range(5):
+            ret, _ = cap.read()
+            if ret:
+                ok = True
+                break
+            time.sleep(0.1)
+
+        if ok:
             print(f"  Camera {index}: opened with backend {backend}")
-            return cap          # returned OPEN — caller must eventually release
+            return cap
         cap.release()
     return None
 
@@ -122,6 +122,18 @@ class CameraFeed:
             else:
                 consecutive_failures += 1
                 time.sleep(0.05)
+                # After 30 consecutive failures (~1.5s), try to reopen the camera
+                if consecutive_failures >= 30:
+                    print(f"  Camera {self.index}: too many failures, reopening…")
+                    self.cap.release()
+                    time.sleep(0.5)
+                    new_cap = _try_open(self.index)
+                    if new_cap is not None:
+                        self.cap = new_cap
+                        consecutive_failures = 0
+                        print(f"  Camera {self.index}: reopened successfully")
+                    else:
+                        consecutive_failures = 0  # reset to avoid spin-loop
 
     def get_frame(self):
         with self._lock:

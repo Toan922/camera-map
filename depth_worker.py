@@ -108,14 +108,11 @@ def _load_model_thread():
     try:
         import torch
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype  = (torch.bfloat16
-                  if (torch.cuda.is_available() and
-                      torch.cuda.get_device_capability()[0] >= 8)
-                  else torch.float16
-                  if torch.cuda.is_available()
-                  else torch.float32)
+        # DA3's image processor outputs float32 tensors, so we must keep model weights in float32
+        # (autocast handles the mixed precision internally in forward())
+        dtype = torch.float32
 
-        print(f"[DepthWorker] Loading DA3Mono-Large on {device} ({dtype})…")
+        print(f"[DepthWorker] Loading DA3Mono-Large on {device} (torch.float32)…")
 
         try:
             # Primary: use the installed depth_anything_3 package
