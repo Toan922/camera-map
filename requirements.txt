@@ -1,9 +1,24 @@
 # Camera Map – Python Dependencies
 # Install all dependencies with:
 #   python -m pip install -r requirements.txt
+#   (See setup.bat for the full installation sequence including GPU torch)
 
+# ── Core camera viewer ────────────────────────────────────────────────────────
 opencv-python>=4.8.0   # Camera capture and frame processing
 Pillow>=10.0.0         # Image conversion for Tkinter display
-numpy>=1.24.0          # Array handling (installed automatically with opencv-python)
+numpy>=1.24.0,<2.0     # Array handling  (DA3 requires numpy<2)
 
-# Note: tkinter is bundled with Python 3 and does not need to be installed separately.
+# ── Depth Anything 3 – inference runtime ──────────────────────────────────────
+# torch and torchvision are installed separately via setup.bat with the CUDA index URL
+# (pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124)
+einops>=0.6.0          # Tensor manipulation used by DA3
+huggingface_hub>=0.20  # Model download from HuggingFace
+safetensors>=0.4.0     # Fast/safe model weight loading
+transformers>=4.40.0   # HuggingFace transformers (fallback pipeline)
+
+# DA3 package itself – install with --no-deps to avoid open3d (no py3.13 wheels):
+#   python -m pip install "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git" --no-deps
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# tkinter is bundled with Python 3 – no separate install needed.
+# open3d is NOT required for inference-only usage.
