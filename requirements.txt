@@ -15,7 +15,7 @@ einops>=0.6.0          # Tensor manipulation used by DA3
 huggingface_hub>=0.20  # Model download from HuggingFace
 safetensors>=0.4.0     # Fast/safe model weight loading
 transformers>=4.40.0   # HuggingFace transformers (fallback pipeline)
-
+omegaconf              # Config management (required by depth-anything-3)
 # DA3 package itself – install with --no-deps to avoid open3d (no py3.13 wheels):
 #   python -m pip install "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git" --no-deps
 
