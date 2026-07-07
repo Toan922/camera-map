@@ -279,10 +279,10 @@ class DepthWorker:
 
         if model_type == "da3":
             # ── DA3Mono-Large native API ────────────────────────────────
-            # model([pil_img]) → Predictions object
+            # model.inference([pil_img]) → Predictions object
             # predictions.depth[0] → H×W float32 numpy array
             with torch.inference_mode():
-                predictions = model([pil_img])
+                predictions = model.inference([pil_img])
             depth_np = predictions.depth[0]           # H×W float32
 
         elif model_type == "hf_pipeline":
