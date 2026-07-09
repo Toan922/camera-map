@@ -1,6 +1,11 @@
-gradio_imageslider
+# Core — depth model + webcam testbed (test.py)
+# Python 3.13 / tested on macOS (MPS)
+torch>=2.12
+torchvision>=0.27
+opencv-python>=4.13
+numpy>=2.0
+
+# Gradio demo only (app.py) — not needed for the tracking pipeline
 gradio
+gradio_imageslider
 matplotlib
-opencv-python
-torch
-torchvision
