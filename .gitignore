@@ -1,6 +1,11 @@
-# Model checkpoints (download via README / huggingface, ~100MB+ each)
+# Model checkpoints (download via SETUP.md / huggingface, ~100MB+ each)
 checkpoints/
 *.pth
+# YOLO weights (auto-downloaded by view3d.py)
+*.pt
+
+# rerun recordings (--save)
+*.rrd
 
 # Python
 __pycache__/
