@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'met
 import cv2
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 import torch
 from ultralytics import YOLO
 
@@ -28,6 +29,7 @@ from depth_anything_v2.dpt import DepthAnythingV2  # metric variant
 DEVICE = 'mps'
 INPUT_SIZE = 384
 MAX_DEPTH = 20.0
+DEPTH_SCALE = 0.71  # tape-measure correction, see test.py (set 1.0 to disable)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--camera', type=int, default=0)
@@ -82,9 +84,17 @@ yn = (vs - cy) / fy
 rr.init('camera-map', spawn=args.save is None)
 if args.save:
     rr.save(args.save)
+# explicit layout: 3D scene + live camera view (also overrides any stale saved layout)
+rr.send_blueprint(rrb.Blueprint(
+    rrb.Horizontal(
+        rrb.Spatial3DView(origin='world', name='3D scene'),
+        rrb.Spatial2DView(origin='world/camera/image', name='camera'),
+        column_shares=[2, 1],
+    ),
+))
 rr.log('world', rr.ViewCoordinates.RDF, static=True)  # X right, Y down, Z forward (camera frame)
-rr.log('world/camera', rr.Pinhole(resolution=[W, H], focal_length=[fx, fy],
-                                  principal_point=[cx, cy], image_plane_distance=0.3), static=True)
+rr.log('world/camera/image', rr.Pinhole(resolution=[W, H], focal_length=[fx, fy],
+                                        principal_point=[cx, cy], image_plane_distance=0.3), static=True)
 
 frame_i = 0
 fps = 0.0
@@ -97,7 +107,7 @@ try:
             frame = cv2.remap(frame, *undistort_maps, cv2.INTER_LINEAR)
 
         t0 = time.time()
-        depth = depth_model.infer_image(frame, input_size=INPUT_SIZE)   # HxW meters
+        depth = depth_model.infer_image(frame, input_size=INPUT_SIZE) * DEPTH_SCALE  # HxW meters
         detections = yolo(frame, classes=[0], device=DEVICE, verbose=False)[0]  # class 0 = person
 
         rr.set_time('frame', sequence=frame_i)
@@ -125,8 +135,9 @@ try:
                                           colors=[(80, 200, 255)]))
 
         # camera image (jpeg-compressed so the stream stays light)
-        rr.log('world/camera', rr.EncodedImage(contents=cv2.imencode('.jpg', frame)[1].tobytes(),
-                                               media_type='image/jpeg'))
+        rr.log('world/camera/image',
+               rr.EncodedImage(contents=cv2.imencode('.jpg', frame)[1].tobytes(),
+                               media_type='image/jpeg'))
 
         fps = 0.9 * fps + 0.1 * (1.0 / max(time.time() - t0, 1e-6))
         frame_i += 1

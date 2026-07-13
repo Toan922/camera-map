@@ -19,6 +19,8 @@ from depth_anything_v2.dpt import DepthAnythingV2  # metric variant (sigmoid * m
 DEVICE = 'mps'          # MacBook GPU (Metal)
 INPUT_SIZE = 384        # model input; smaller = faster, 518 = finer detail
 MAX_DEPTH = 20.0        # Hypersim indoor model range
+DEPTH_SCALE = 0.71      # tape-measure correction: model over-reads ~1.4-1.6x on this camera
+                        # (fit 2026-07: actual 1/2/3m read 1.58/3.0/4.0m). Set 1.0 to disable.
 VIS_RANGE = 5.0         # fixed color scale in meters (indoor-friendly contrast)
 DISPLAY_W = 1600        # total width of the side-by-side window
 
@@ -53,7 +55,7 @@ while True:
     mouse_param['frame_w'] = w
 
     t0 = time.time()
-    depth = model.infer_image(frame, input_size=INPUT_SIZE)  # HxW meters
+    depth = model.infer_image(frame, input_size=INPUT_SIZE) * DEPTH_SCALE  # HxW meters
     fps = 0.9 * fps + 0.1 * (1.0 / max(time.time() - t0, 1e-6))
 
     # Colorize: fixed scale keeps colors stable frame-to-frame (better for metric sanity)
