@@ -95,7 +95,7 @@ Constants at the top of `test.py` / `view3d.py`:
 
 - `INPUT_SIZE` — 384 (fast) → 518 (finer detail, ~half the FPS)
 - `MAX_DEPTH` — 20 m for the Hypersim indoor model; 80 for a VKITTI (outdoor) checkpoint
-- `DEVICE` — `mps`; change to `cuda` / `cpu` off-Mac
+- `DEVICE` — auto-detected (`cuda` > `mps` > `cpu`); override with the `DEVICE` env var, e.g. `DEVICE=cpu python test.py`
 - `VIS_RANGE` (test.py) — fixed color scale range in meters
 
 ## Notes

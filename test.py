@@ -16,7 +16,10 @@ import torch
 import numpy as np
 from depth_anything_v2.dpt import DepthAnythingV2  # metric variant (sigmoid * max_depth)
 
-DEVICE = 'mps'          # MacBook GPU (Metal)
+DEVICE = os.environ.get('DEVICE') or (        # auto: NVIDIA > Apple GPU > CPU
+    'cuda' if torch.cuda.is_available()
+    else 'mps' if torch.backends.mps.is_available()
+    else 'cpu')
 INPUT_SIZE = 384        # model input; smaller = faster, 518 = finer detail
 MAX_DEPTH = 20.0        # Hypersim indoor model range
 DEPTH_SCALE = 0.71      # tape-measure correction: model over-reads ~1.4-1.6x on this camera
@@ -29,6 +32,7 @@ model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 
 model.load_state_dict(torch.load('checkpoints/depth_anything_v2_metric_hypersim_vits.pth',
                                  map_location='cpu'))
 model = model.to(DEVICE).eval()
+print(f'device: {DEVICE}')
 
 cap = cv2.VideoCapture(0)
 probe = None            # (x, y) in full-frame coords; None = frame center

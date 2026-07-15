@@ -26,10 +26,15 @@ from ultralytics import YOLO
 
 from depth_anything_v2.dpt import DepthAnythingV2  # metric variant
 
-DEVICE = 'mps'
+DEVICE = os.environ.get('DEVICE') or (  # auto: NVIDIA > Apple GPU > CPU
+    'cuda' if torch.cuda.is_available()
+    else 'mps' if torch.backends.mps.is_available()
+    else 'cpu')
 INPUT_SIZE = 384
 MAX_DEPTH = 20.0
 DEPTH_SCALE = 0.71  # tape-measure correction, see test.py (set 1.0 to disable)
+FADE_COLOR = np.array([168.0, 85.0, 247.0])  # point cloud fades toward this (purple)
+FADE_STRENGTH = 0.85  # how tinted the farthest point gets (1.0 = solid purple, 0 = off)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--camera', type=int, default=0)
@@ -55,6 +60,7 @@ depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96,
 depth_model.load_state_dict(torch.load('checkpoints/depth_anything_v2_metric_hypersim_vits.pth',
                                        map_location='cpu'))
 depth_model = depth_model.to(DEVICE).eval()
+print(f'device: {DEVICE}')
 yolo = YOLO('yolo11n.pt')  # auto-downloads on first run
 
 # --- camera ---
@@ -116,7 +122,12 @@ try:
         # point cloud: back-project subsampled depth through the pinhole model
         z = depth[::s, ::s]
         pts = np.stack([xn * z, yn * z, z], axis=-1).reshape(-1, 3)
-        rr.log('world/points', rr.Points3D(pts, colors=rgb[::s, ::s].reshape(-1, 3), radii=0.01))
+        # distance fade: nearest point true color -> farthest most purple, rescaled
+        # per frame (percentiles, not min/max, so a few outlier pixels don't flicker it)
+        z_lo, z_hi = np.percentile(z, [2, 98])
+        fade = np.clip((z - z_lo) / max(z_hi - z_lo, 1e-6), 0, 1)[..., None] * FADE_STRENGTH
+        colors = (rgb[::s, ::s] * (1 - fade) + FADE_COLOR * fade).astype(np.uint8)
+        rr.log('world/points', rr.Points3D(pts, colors=colors.reshape(-1, 3), radii=0.01))
 
         # person boxes: median depth over the torso region of each bbox -> 3D box
         centers, half_sizes, labels = [], [], []
