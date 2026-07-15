@@ -1,7 +1,7 @@
 # Core — depth model + webcam testbed (test.py)
 # Python 3.13 / tested on macOS (MPS)
-torch>=2.12
-torchvision>=0.27
+# torch>=2.12
+# torchvision>=0.27
 opencv-python>=4.13
 numpy>=2.0
 
