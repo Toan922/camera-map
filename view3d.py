@@ -9,13 +9,19 @@ guessed 70-degree FOV with a warning). For multi-camera, each json also needs an
 world frame (the checkerboard's frame, Z up) so their point clouds merge into one
 scene. Without extrinsics a camera sits at the world origin.
 
+Performance: each camera has a capture thread that reads + undistorts frames and
+keeps only the newest one, so the main loop never blocks on camera I/O. On CUDA the
+depth preprocessing (resize/normalize) runs on the GPU instead of numpy.
+
 Opens the rerun viewer: merged point cloud, one frustum + live image per camera,
 and a 3D box per detected person with distance label. Ctrl+C in the terminal to stop.
 """
 import argparse
 import json
+import math
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'metric_depth'))
@@ -25,6 +31,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 import torch
+import torch.nn.functional as TF
 from ultralytics import YOLO
 
 from depth_anything_v2.dpt import DepthAnythingV2  # metric variant
@@ -40,6 +47,7 @@ DEPTH_SCALE = 0.71  # tape-measure correction, see test.py — per-camera overri
 FADE_COLOR = np.array([168.0, 85.0, 247.0])  # point cloud fades toward this (purple)
 FADE_STRENGTH = 0.85  # how tinted the farthest point gets (1.0 = solid purple, 0 = off)
 BOX_COLORS = [(80, 200, 255), (255, 170, 80), (170, 255, 120), (255, 120, 200)]  # per camera
+DISPLAY_SCALE = 0.5  # camera images shown in the viewer at this scale (geometry unaffected)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--cameras', default='0', help='comma-separated camera indices, e.g. 0,1')
@@ -50,6 +58,9 @@ args = parser.parse_args()
 cam_indices = [int(x) for x in args.cameras.split(',')]
 
 # --- models (shared across cameras) ---
+if DEVICE == 'cuda':
+    torch.set_float32_matmul_precision('high')  # TF32 matmuls, ~20% faster forward
+    torch.backends.cudnn.benchmark = True
 depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384],
                               max_depth=MAX_DEPTH)
 depth_model.load_state_dict(torch.load('checkpoints/depth_anything_v2_metric_hypersim_vits.pth',
@@ -57,6 +68,55 @@ depth_model.load_state_dict(torch.load('checkpoints/depth_anything_v2_metric_hyp
 depth_model = depth_model.to(DEVICE).eval()
 print(f'device: {DEVICE}')
 yolo = YOLO('yolo11n.pt')  # auto-downloads on first run
+
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
+
+
+def infer_depth(frame_bgr, model_size_hw):
+    """model.infer_image with the resize/normalize moved onto the GPU — the numpy
+    preprocess costs ~19 ms per 1080p frame, this path ~2 ms. CUDA only; other
+    devices use the stock infer_image."""
+    if DEVICE != 'cuda':
+        return depth_model.infer_image(frame_bgr, input_size=INPUT_SIZE)
+    x = torch.from_numpy(frame_bgr).to(DEVICE)
+    x = x.flip(-1).permute(2, 0, 1)[None].float().div_(255)  # BGR uint8 -> RGB 0..1
+    x = TF.interpolate(x, size=model_size_hw, mode='bicubic', align_corners=False)
+    x = (x - IMAGENET_MEAN) / IMAGENET_STD
+    with torch.no_grad():
+        d = depth_model(x)
+    d = TF.interpolate(d[:, None], size=frame_bgr.shape[:2], mode='bilinear', align_corners=True)
+    return d[0, 0].cpu().numpy()
+
+
+class Grabber(threading.Thread):
+    """Reads frames as fast as the camera delivers them, undistorts off the main
+    thread, and keeps only the newest frame — the pipeline never blocks on I/O."""
+
+    def __init__(self, cap, undistort_maps):
+        super().__init__(daemon=True)
+        self.cap, self.maps = cap, undistort_maps
+        self.lock = threading.Lock()
+        self.frame = None
+        self.alive = True
+
+    def run(self):
+        while self.alive:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.alive = False
+                break
+            if self.maps is not None:
+                frame = cv2.remap(frame, *self.maps, cv2.INTER_LINEAR)
+            with self.lock:
+                self.frame = frame
+
+    def take(self):
+        """Newest unseen frame, or None if the camera hasn't produced one yet."""
+        with self.lock:
+            frame, self.frame = self.frame, None
+            return frame
+
 
 # --- cameras: capture + intrinsics + extrinsics per index ---
 s = args.stride
@@ -96,10 +156,16 @@ for idx in cam_indices:
     elif len(cam_indices) > 1:
         print(f'cam{idx}: WARNING: no extrinsics — run extrinsics.py, else this camera sits at the world origin')
 
+    # model input size: aspect-preserving, both dims >= INPUT_SIZE, multiples of 14
+    scale = INPUT_SIZE / min(H, W)
+    model_size_hw = (math.ceil(H * scale / 14) * 14, math.ceil(W * scale / 14) * 14)
+
     us, vs = np.meshgrid(np.arange(0, W, s), np.arange(0, H, s))
+    grabber = Grabber(cap, undistort_maps)
+    grabber.start()
     cams.append(dict(
-        idx=idx, cap=cap, W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy,
-        undistort_maps=undistort_maps, extrinsics=extrinsics,
+        idx=idx, cap=cap, grabber=grabber, W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy,
+        extrinsics=extrinsics, model_size_hw=model_size_hw,
         depth_scale=(calib or {}).get('depth_scale', DEPTH_SCALE),
         xn=(us - cx) / fx, yn=(vs - cy) / fy,  # normalized ray directions at stride
     ))
@@ -126,38 +192,39 @@ for c in cams:
     if c['extrinsics']:
         rr.log(base, rr.Transform3D(translation=c['extrinsics']['t'],
                                     mat3x3=c['extrinsics']['R']), static=True)
+    d = DISPLAY_SCALE  # pinhole matches the downscaled display image; same FOV either way
     rr.log(f'{base}/image',
-           rr.Pinhole(resolution=[c['W'], c['H']], focal_length=[c['fx'], c['fy']],
-                      principal_point=[c['cx'], c['cy']], image_plane_distance=0.3,
+           rr.Pinhole(resolution=[c['W'] * d, c['H'] * d], focal_length=[c['fx'] * d, c['fy'] * d],
+                      principal_point=[c['cx'] * d, c['cy'] * d], image_plane_distance=0.3,
                       camera_xyz=rr.ViewCoordinates.RDF), static=True)
 
 frame_i = 0
 fps = 0.0
+running = True
 try:
-    while True:
-        # grab all cameras first (near-simultaneous), then decode — keeps them in sync
-        if not all(c['cap'].grab() for c in cams):
-            break
+    while running:
+        # newest frame from every camera; block (briefly) only if one hasn't arrived yet
         frames = []
         for c in cams:
-            ret, frame = c['cap'].retrieve()
-            if not ret:
+            frame = c['grabber'].take()
+            while frame is None and c['grabber'].alive:
+                time.sleep(0.001)
+                frame = c['grabber'].take()
+            if frame is None:
+                running = False
                 break
             frames.append(frame)
-        if len(frames) < len(cams):
+        if not running:
             break
 
         t0 = time.time()
         rr.set_time('frame', sequence=frame_i)
+        detections = yolo(frames, classes=[0], device=DEVICE, verbose=False)  # one batched call
         n_people = 0
 
         for cam_i, (c, frame) in enumerate(zip(cams, frames)):
             base = f'world/cam{c["idx"]}'
-            if c['undistort_maps'] is not None:
-                frame = cv2.remap(frame, *c['undistort_maps'], cv2.INTER_LINEAR)
-
-            depth = depth_model.infer_image(frame, input_size=INPUT_SIZE) * c['depth_scale']  # HxW meters
-            detections = yolo(frame, classes=[0], device=DEVICE, verbose=False)[0]  # class 0 = person
+            depth = infer_depth(frame, c['model_size_hw']) * c['depth_scale']  # HxW meters
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # point cloud in camera coords — the Transform3D on world/cam<idx> places it in the world
@@ -172,7 +239,7 @@ try:
 
             # person boxes: median depth over the torso region of each bbox -> 3D box
             centers, half_sizes, labels = [], [], []
-            for box in detections.boxes:
+            for box in detections[cam_i].boxes:
                 x1, y1, x2, y2 = box.xyxy[0].int().tolist()
                 bw, bh = x2 - x1, y2 - y1
                 torso = depth[y1 + bh // 4: y2 - bh // 4, x1 + bw // 4: x2 - bw // 4]
@@ -187,9 +254,10 @@ try:
                                                 colors=[BOX_COLORS[cam_i % len(BOX_COLORS)]]))
             n_people += len(centers)
 
-            # camera image (jpeg-compressed so the stream stays light)
+            # camera image, downscaled + jpeg-compressed so the stream stays light
+            small = cv2.resize(frame, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
             rr.log(f'{base}/image',
-                   rr.EncodedImage(contents=cv2.imencode('.jpg', frame)[1].tobytes(),
+                   rr.EncodedImage(contents=cv2.imencode('.jpg', small)[1].tobytes(),
                                    media_type='image/jpeg'))
 
         fps = 0.9 * fps + 0.1 * (1.0 / max(time.time() - t0, 1e-6))
@@ -202,4 +270,7 @@ except KeyboardInterrupt:
     pass
 finally:
     for c in cams:
+        c['grabber'].alive = False
+    for c in cams:
+        c['grabber'].join(timeout=1.0)
         c['cap'].release()
