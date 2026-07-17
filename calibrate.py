@@ -30,6 +30,10 @@ objp = np.zeros((CHESSBOARD[0] * CHESSBOARD[1], 3), np.float32)
 objp[:, :2] = np.mgrid[0:CHESSBOARD[0], 0:CHESSBOARD[1]].T.reshape(-1, 2) * args.square_size
 
 cap = cv2.VideoCapture(args.camera)
+# Windows opens webcams at 640x480 by default; request full res so calibration
+# happens at the same resolution the pipeline runs at
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 obj_points, img_points = [], []
 frame_size = None
 flash_until = 0

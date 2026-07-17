@@ -68,17 +68,36 @@ Press **C** to solve and save `calibration/camera_0.json`.
 
 Quality gate: RMS reprojection error **< 0.5 px** is good; > 1 px → recapture.
 
-### 3. `view3d.py` — live 3D scene (rerun viewer)
+### 3. `extrinsics.py` — camera pose in the shared world (per camera, per placement)
+
+Lay the same checkerboard **flat** (floor / table) where the camera can see it — the
+board defines the world origin. With board and camera both static:
 
 ```bash
-python view3d.py                       # Ctrl+C to stop
+python extrinsics.py --camera 0        # then --camera 1, without moving the board
 ```
 
-Opens the [rerun](https://rerun.io) viewer: live point cloud of the room, camera
-frustum with the video feed, and a 3D box per detected person labeled with distance.
+**SPACE** captures a sample when corners are green (~10 samples averages out noise),
+**C** solves and saves the pose into `calibration/camera_<idx>.json` under
+`"extrinsics"`. Repeat for each camera **without moving the board** — that's what puts
+them all in one world frame. Redo whenever a camera physically moves.
 
-- Uses `calibration/camera_0.json` automatically (falls back to a guessed 70° FOV
+### 4. `view3d.py` — live 3D scene (rerun viewer)
+
+```bash
+python view3d.py                       # single camera, Ctrl+C to stop
+python view3d.py --cameras 0,1         # multi-camera, merged into one world
+```
+
+Opens the [rerun](https://rerun.io) viewer: live point cloud, a frustum with video
+feed per camera, and a 3D box per detected person labeled with distance.
+
+- Uses `calibration/camera_<idx>.json` automatically (falls back to a guessed 70° FOV
   with a warning — works, but calibrate for real geometry)
+- Multi-camera needs `"extrinsics"` in each json (from `extrinsics.py`); a camera
+  without it sits at the world origin
+- Per-camera depth-scale correction: add a `"depth_scale"` key to the camera's json
+  (defaults to the `DEPTH_SCALE` constant, measured by the tape-measure test)
 - `--stride 8` — point cloud density (lower = denser = slower)
 - `--save out.rrd --max-frames 300` — record headless, open later with `rerun out.rrd`
 

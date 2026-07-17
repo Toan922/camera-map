@@ -63,9 +63,11 @@ many angles (OpenCV solves for the numbers that best explain all views). Without
 1. **Phase 0 — metric depth** ✅ `test.py` (probe a pixel, read meters)
 2. **Phase 1 — one camera → 3D** ✅ `calibrate.py` + `view3d.py` (point cloud, camera pose, person boxes in rerun)
 3. **Phase 2 — humans in 3D** ✅ partially: YOLO boxes lifted to 3D (keypoints/skeletons later)
-4. **Phase 3 — multiple cameras, one world** — extrinsics: where each camera sits in a
-   shared world frame (AprilTag/board visible to all cameras defines the origin), time
-   sync, then all point clouds merge into one scene
+4. **Phase 3 — multiple cameras, one world** ✅ `extrinsics.py` + `view3d.py --cameras 0,1`
+   — the checkerboard defines the world origin; solvePnP per camera gives its pose
+   (`R`, `t`) in that frame, saved next to the intrinsics; view3d logs each camera
+   under its own `Transform3D` so rerun merges all point clouds into one scene.
+   Frames are `grab()`-ed together for rough time sync
 5. **Phase 4 — fusion + tracking** — match the same person across cameras by 3D
    proximity, Kalman filter per person, Hungarian assignment per frame (SORT in 3D)
 6. **Phase 5 — realtime engineering** — one shared depth model round-robining ~4

@@ -35,6 +35,10 @@ model = model.to(DEVICE).eval()
 print(f'device: {DEVICE}')
 
 cap = cv2.VideoCapture(0)
+# Windows opens webcams at 640x480 by default; request full res so the FOV (and thus
+# the measured depth-scale bias) matches the rest of the pipeline
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 probe = None            # (x, y) in full-frame coords; None = frame center
 fixed_scale = True
 fps = 0.0
