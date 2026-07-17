@@ -101,6 +101,18 @@ feed per camera, and a 3D box per detected person labeled with distance.
 - `--stride 8` — point cloud density (lower = denser = slower)
 - `--save out.rrd --max-frames 300` — record headless, open later with `rerun out.rrd`
 
+### 5. `view3d_ultra.py` — threaded edition (same scene, more FPS)
+
+```bash
+python view3d_ultra.py --cameras 0,1
+```
+
+Same flags and output as `view3d.py`, but each camera runs its full pipeline
+(capture → depth → detection → logging) in its own worker thread, so GPU inference
+overlaps CPU work and cameras run decoupled at their own rate (~26 FPS each on an
+RTX 5070 Ti vs ~20 lockstep). Prefer it on a machine with a discrete GPU;
+`view3d.py` is the simpler sequential fallback for slower machines.
+
 ## Suggested first-run order
 
 1. `python view3d.py` — see the room in 3D immediately (guessed FOV)
