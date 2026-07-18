@@ -11,6 +11,7 @@ is one ingredient — the rest is camera geometry, detection, and (later) tracki
 | **YOLO** (yolo11n) | A second, unrelated neural net | Finds people as 2D pixel rectangles in the frame | Knows nothing about depth |
 | **Back-projection** | Plain math, no AI | Converts depth map → 3D point cloud, and 2D boxes → 3D boxes | — |
 | **Camera calibration** | One-time measurement | Measures your camera's real geometry (focal length, center, distortion) so the math above is correct | — |
+| **TSDF fusion** (`fusion.py`) | Plain math, no AI | Integrates depth frames from all cameras over time into one persistent voxel model of the room | Nothing per-frame — it's an accumulator |
 | **rerun** | Viewer only | Draws points/boxes/images in an interactive 3D window with a timeline | Computes nothing. Zero AI, zero math |
 
 ## Data flow per frame (`view3d.py`)
@@ -58,6 +59,30 @@ numbers + distortion, unique to each physical camera:
 many angles (OpenCV solves for the numbers that best explain all views). Without it,
 `view3d.py` guesses a 70° FOV — shapes look roughly right, distances less trustworthy.
 
+## How the fused room works (`fusion.py`)
+
+The room doesn't move, so it shouldn't be re-derived from a single noisy frame 26
+times a second. Instead the world is split in two:
+
+- **Static room** — a TSDF (truncated signed distance field): a fixed grid of
+  ~4 cm voxels, each storing a running average of "how far am I from the nearest
+  surface, as seen by any camera so far". Every ~0.4 s per camera, all voxels are
+  projected into that camera's depth map and updated: voxels the camera sees
+  *through* are carved empty, voxels near the observed depth accumulate the
+  surface (and its color). Averaging hundreds of frames from both viewpoints
+  cancels most of the monocular depth noise; the carving also erases ghosts if
+  something (or someone) moves away. Person pixels are masked out before
+  integration so people never smear into the walls.
+- **Dynamic people** — each camera's person detections are transformed into world
+  coordinates and clustered by proximity (detections < 0.75 m apart from
+  *different* cameras = same person). One box per human, however many cameras
+  see them.
+
+Known ceiling: monocular depth error is not a constant scale — the two cameras
+can disagree by 10–30 cm on the same wall, and flat walls bow slightly. TSDF
+averaging softens this; per-camera `depth_scale` calibration (and later ICP
+alignment) is the real fix.
+
 ## The full roadmap
 
 1. **Phase 0 — metric depth** ✅ `test.py` (probe a pixel, read meters)
@@ -68,8 +93,13 @@ many angles (OpenCV solves for the numbers that best explain all views). Without
    (`R`, `t`) in that frame, saved next to the intrinsics; view3d logs each camera
    under its own `Transform3D` so rerun merges all point clouds into one scene.
    Frames are `grab()`-ed together for rough time sync
-5. **Phase 4 — fusion + tracking** — match the same person across cameras by 3D
-   proximity, Kalman filter per person, Hungarian assignment per frame (SORT in 3D)
+5. **Phase 4 — fusion + tracking** ✅ partially: `view3d_fusion.py` + `fusion.py`
+   — (a) *one room:* per-camera depth (people masked out) is integrated into a
+   shared TSDF voxel grid — hundreds of noisy frames average into one stable
+   surface, Tesla-occupancy-style but via geometry instead of a learned network;
+   (b) *one person:* detections from all cameras are clustered by world-space
+   proximity into a single box each. Still to come: persistent per-person IDs,
+   Kalman filter per person, Hungarian assignment per frame (SORT in 3D)
 6. **Phase 5 — realtime engineering** — one shared depth model round-robining ~4
    cameras, capture thread per camera keeping only the latest frame, MJPEG/720p to
    survive USB bandwidth

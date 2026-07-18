@@ -113,6 +113,28 @@ overlaps CPU work and cameras run decoupled at their own rate (~26 FPS each on a
 RTX 5070 Ti vs ~20 lockstep). Prefer it on a machine with a discrete GPU;
 `view3d.py` is the simpler sequential fallback for slower machines.
 
+### 6. `view3d_fusion.py` — one fused room + one box per person (Phase 4)
+
+```bash
+python view3d_fusion.py --cameras 0,1
+```
+
+The step up from overlaying per-camera views to *reconstructing the room*:
+
+- **Persistent room map** (`world/map`) — every camera's depth is integrated over
+  time into one shared TSDF voxel grid (`fusion.py`). Noisy single frames average
+  into a stable surface; each camera fills the others' blind spots. The map
+  appears over the first ~10–20 s and keeps refining. People are masked out
+  before integration (plus free-space carving), so it's the *static* room only.
+- **Fused people** (`world/people`) — detections from all cameras are clustered
+  in world space: a person seen by both cameras is **one** box, labeled with how
+  many cameras see them. `--per-cam-boxes` shows the raw per-camera boxes too.
+
+Flags: `--voxel 0.04` (map resolution), `--bounds x0,x1,y0,y1,z0,z1` (map box,
+default 8×8×3 m around the world origin), `--map-interval` (integration cadence),
+`--no-map`. `python fusion.py` self-tests the TSDF math on synthetic data — no
+camera needed.
+
 ## Suggested first-run order
 
 1. `python view3d.py` — see the room in 3D immediately (guessed FOV)
