@@ -11,11 +11,14 @@ What's new over view3d_ultra.py (which just overlays per-camera views):
   others' blind spots; it appears over the first ~10-20 s and keeps refining.
   People are masked out of the depth before integration, and free-space carving
   erases any residue, so the map is the *static* room only.
-- Fused people — per-camera detections are transformed to world space and
-  clustered across cameras (two detections from the same camera never merge):
-  a person seen by both cameras becomes ONE box at world/people, labeled with
-  how many cameras currently see them. Per-camera boxes are off by default
-  (--per-cam-boxes to debug association).
+- Tracked people (SORT in 3D) — per-camera detections are transformed to world
+  space, clustered across cameras (two detections from the same camera never
+  merge), then fed to one constant-velocity Kalman filter per person with
+  Hungarian assignment (fusion.py). A person seen by both cameras is ONE box at
+  world/people with a persistent #ID, a stable color, a speed label, and a
+  velocity arrow when moving; through short detection dropouts the box coasts
+  on its predicted path (dimmed, "predicted"). Per-camera raw boxes are off by
+  default (--per-cam-boxes to debug association).
 
 Architecture: the per-camera workers are unchanged from view3d_ultra.py
 (capture -> depth -> detection -> live point cloud, one thread per camera);
@@ -47,7 +50,7 @@ import torch.nn.functional as TF
 from ultralytics import YOLO
 
 from depth_anything_v2.dpt import DepthAnythingV2  # metric variant
-from fusion import TSDFGrid, fuse_people
+from fusion import TSDFGrid, fuse_people, PersonTracker
 
 DEVICE = os.environ.get('DEVICE') or (  # auto: NVIDIA > Apple GPU > CPU
     'cuda' if torch.cuda.is_available()
@@ -60,7 +63,8 @@ DEPTH_SCALE = 0.71  # tape-measure correction, see test.py — per-camera overri
 FADE_COLOR = np.array([168.0, 85.0, 247.0])  # live point cloud fades toward this (purple)
 FADE_STRENGTH = 0.85  # how tinted the farthest point gets (1.0 = solid purple, 0 = off)
 BOX_COLORS = [(80, 200, 255), (255, 170, 80), (170, 255, 120), (255, 120, 200)]  # per camera
-FUSED_COLOR = (255, 90, 90)  # the one true box per person
+TRACK_COLORS = [(255, 90, 90), (90, 200, 255), (255, 210, 80), (150, 255, 130),
+                (230, 120, 255), (255, 150, 60), (120, 160, 255), (255, 240, 180)]  # per track ID
 DISPLAY_SCALE = 0.5  # camera images shown in the viewer at this scale (geometry unaffected)
 PERSON_MERGE_M = 0.75  # detections from different cameras closer than this = same person
 DET_MAX_AGE = 0.5  # s — a camera's detections older than this drop out of fusion
@@ -240,13 +244,15 @@ class Worker(threading.Thread):
 
 
 class FusionThread(threading.Thread):
-    """Owns the shared room. Merges every camera's person detections into single
-    world-space boxes (world/people) and integrates their masked depth into the
-    persistent TSDF map (world/map)."""
+    """Owns the shared room. Merges every camera's person detections into
+    world-space clusters, runs the 3D SORT tracker over them (world/people:
+    one box + persistent ID + velocity per person), and integrates the masked
+    depth into the persistent TSDF map (world/map)."""
 
     def __init__(self, cams, grid, stop):
         super().__init__(daemon=True)
         self.cams, self.grid, self.stop = cams, grid, stop
+        self.tracker = PersonTracker(gate=PERSON_MERGE_M * 1.6)
         self.n_people, self.n_map, self.ticks = 0, 0, 0
 
     def run(self):
@@ -257,24 +263,41 @@ class FusionThread(threading.Thread):
             rr.set_time('frame', sequence=self.ticks)
             rr.set_time('time', timestamp=now)
 
-            # --- fused people: fresh detections from all cameras, clustered in world space ---
+            # --- people: cluster fresh detections across cameras, then track ---
             dets = []
             for c in self.cams:
                 with c['lock']:
                     t_d, ds = c['dets']
                 if now - t_d < DET_MAX_AGE:
                     dets += [(c['idx'], d) for d in ds]
-            centers, half_sizes, labels = [], [], []
-            for cl in fuse_people(dets, merge_dist=PERSON_MERGE_M):
-                ctr = np.mean([d['center'] for _, d in cl], axis=0)
-                h = max(max(d['height'] for _, d in cl), 0.5)
+            meas = [dict(center=np.mean([d['center'] for _, d in cl], axis=0),
+                         height=max(d['height'] for _, d in cl), n_cams=len(cl))
+                    for cl in fuse_people(dets, merge_dist=PERSON_MERGE_M)]
+            tracks = self.tracker.step(meas, now)
+
+            centers, half_sizes, labels, colors = [], [], [], []
+            arr_o, arr_v, arr_c = [], [], []
+            for tr in tracks:
+                col = TRACK_COLORS[tr['id'] % len(TRACK_COLORS)]
+                h = max(tr['height'], 0.5)
+                centers.append(tr['center'].tolist())
                 # axis-aligned person box: world Z is up with extrinsics, camera -Y without
                 half_sizes.append([0.3, 0.3, h / 2] if have_extrinsics else [0.3, h / 2, 0.3])
-                centers.append(ctr.tolist())
-                labels.append(f'person ({len(cl)} cam)')
+                speed = float(np.linalg.norm(tr['vel']))
+                if tr['matched']:
+                    labels.append(f'#{tr["id"]} {speed:.1f} m/s ({tr["n_cams"]} cam)')
+                    colors.append(col)
+                else:  # coasting on the Kalman prediction through a detection dropout
+                    labels.append(f'#{tr["id"]} (predicted)')
+                    colors.append(tuple(v // 2 for v in col))
+                if speed > 0.3:  # velocity arrow: where they're headed in the next ~0.7 s
+                    arr_o.append(tr['center'].tolist())
+                    arr_v.append((tr['vel'] * 0.7).tolist())
+                    arr_c.append(col)
             rr.log('world/people', rr.Boxes3D(centers=centers, half_sizes=half_sizes,
-                                              labels=labels, colors=[FUSED_COLOR]))
-            self.n_people = len(centers)
+                                              labels=labels, colors=colors))
+            rr.log('world/people/velocity', rr.Arrows3D(origins=arr_o, vectors=arr_v, colors=arr_c))
+            self.n_people = len(tracks)
 
             # --- room map: integrate each camera's newest masked depth, throttled ---
             if self.grid is not None:

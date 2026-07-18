@@ -75,8 +75,12 @@ times a second. Instead the world is split in two:
   integration so people never smear into the walls.
 - **Dynamic people** — each camera's person detections are transformed into world
   coordinates and clustered by proximity (detections < 0.75 m apart from
-  *different* cameras = same person). One box per human, however many cameras
-  see them.
+  *different* cameras = same person). Each cluster then feeds a SORT-style
+  tracker: one constant-velocity Kalman filter per person predicts where they'll
+  be, the Hungarian algorithm matches predictions to this tick's clusters, and
+  each person keeps one #ID (and color) for as long as they're tracked — briefly
+  losing detection just means the box coasts along its predicted path. One box
+  per human, however many cameras see them, with a live velocity arrow.
 
 Known ceiling: monocular depth error is not a constant scale — the two cameras
 can disagree by 10–30 cm on the same wall, and flat walls bow slightly. TSDF
@@ -93,13 +97,15 @@ alignment) is the real fix.
    (`R`, `t`) in that frame, saved next to the intrinsics; view3d logs each camera
    under its own `Transform3D` so rerun merges all point clouds into one scene.
    Frames are `grab()`-ed together for rough time sync
-5. **Phase 4 — fusion + tracking** ✅ partially: `view3d_fusion.py` + `fusion.py`
+5. **Phase 4 — fusion + tracking** ✅ `view3d_fusion.py` + `fusion.py`
    — (a) *one room:* per-camera depth (people masked out) is integrated into a
    shared TSDF voxel grid — hundreds of noisy frames average into one stable
    surface, Tesla-occupancy-style but via geometry instead of a learned network;
    (b) *one person:* detections from all cameras are clustered by world-space
-   proximity into a single box each. Still to come: persistent per-person IDs,
-   Kalman filter per person, Hungarian assignment per frame (SORT in 3D)
+   proximity, then tracked SORT-style in 3D — a constant-velocity Kalman filter
+   per person, Hungarian assignment per tick, persistent #IDs, and coasting on
+   the prediction through detection dropouts. Later niceties: re-identifying
+   someone who left the room and came back (appearance features)
 6. **Phase 5 — realtime engineering** — one shared depth model round-robining ~4
    cameras, capture thread per camera keeping only the latest frame, MJPEG/720p to
    survive USB bandwidth

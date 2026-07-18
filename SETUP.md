@@ -126,9 +126,13 @@ The step up from overlaying per-camera views to *reconstructing the room*:
   into a stable surface; each camera fills the others' blind spots. The map
   appears over the first ~10–20 s and keeps refining. People are masked out
   before integration (plus free-space carving), so it's the *static* room only.
-- **Fused people** (`world/people`) — detections from all cameras are clustered
-  in world space: a person seen by both cameras is **one** box, labeled with how
-  many cameras see them. `--per-cam-boxes` shows the raw per-camera boxes too.
+- **Tracked people** (`world/people`) — detections from all cameras are clustered
+  in world space and tracked SORT-style (Kalman filter per person + Hungarian
+  assignment, `fusion.py`): a person seen by both cameras is **one** box with a
+  persistent `#ID`, its own color, a speed label, and a velocity arrow when
+  moving. If detection drops for a moment the box coasts on its predicted path
+  (dimmed, "predicted") for up to 1.5 s. `--per-cam-boxes` shows the raw
+  per-camera boxes too.
 
 Flags: `--voxel 0.04` (map resolution), `--bounds x0,x1,y0,y1,z0,z1` (map box,
 default 8×8×3 m around the world origin), `--map-interval` (integration cadence),

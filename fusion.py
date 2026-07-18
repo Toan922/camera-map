@@ -14,9 +14,21 @@ space: detections from different cameras within merge_dist of each other are
 the same person; two detections from the SAME camera never merge (they are two
 people by construction).
 
+PersonTracker — SORT in 3D on top of the fused clusters: one constant-velocity
+Kalman filter per person (predict where they'll be, blend in each new
+measurement weighted by confidence), Hungarian assignment to match this tick's
+clusters to existing tracks, and track lifecycle (a track needs min_hits
+matches to be born, survives max_age seconds of missed detections by coasting
+on its predicted velocity, keeps one persistent ID for its whole life).
+
 Run `python fusion.py` to self-test on synthetic data (no camera needed).
 """
 import numpy as np
+
+try:
+    from scipy.optimize import linear_sum_assignment  # ships with ultralytics
+except ImportError:
+    linear_sum_assignment = None
 
 
 class TSDFGrid:
@@ -102,6 +114,103 @@ def fuse_people(dets, merge_dist=0.75):
     return clusters
 
 
+def _assign(cost, gate):
+    """Match rows (tracks) to columns (measurements): globally optimal via the
+    Hungarian algorithm when scipy is present, greedy nearest-pair otherwise.
+    Returns (row, col) pairs with cost below gate."""
+    if linear_sum_assignment is not None:
+        rows, cols = linear_sum_assignment(cost)
+        return [(int(r), int(c)) for r, c in zip(rows, cols) if cost[r, c] < gate]
+    pairs, c = [], cost.astype(np.float64).copy()
+    while c.size and c.min() < gate:
+        r, col = np.unravel_index(np.argmin(c), c.shape)
+        pairs.append((int(r), int(col)))
+        c[r, :] = np.inf
+        c[:, col] = np.inf
+    return pairs
+
+
+class Track:
+    """One person: constant-velocity Kalman state [px py pz vx vy vz] (meters,
+    meters/second, world frame)."""
+
+    def __init__(self, tid, m, now, meas_std, accel_std):
+        self.id = tid
+        self.x = np.concatenate([np.asarray(m['center'], np.float64), np.zeros(3)])
+        self.P = np.diag([meas_std ** 2] * 3 + [1.0] * 3)  # velocity starts unknown
+        self.height = float(m['height'])
+        self.n_cams = int(m.get('n_cams', 1))
+        self.meas_var = meas_std ** 2
+        self.accel_var = accel_std ** 2
+        self.hits = 1
+        self.t_updated = now
+
+    def predict(self, dt):
+        """Advance by physics: position += velocity * dt, uncertainty grows by
+        how much a person could have accelerated meanwhile."""
+        F = np.eye(6)
+        F[:3, 3:] = dt * np.eye(3)
+        I3 = np.eye(3)
+        Q = self.accel_var * np.block([[dt ** 4 / 4 * I3, dt ** 3 / 2 * I3],
+                                       [dt ** 3 / 2 * I3, dt ** 2 * I3]])
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+
+    def update(self, m, now):
+        """Blend the prediction with a measurement, weighted by the Kalman gain
+        (trust in prediction vs. trust in measurement)."""
+        y = np.asarray(m['center'], np.float64) - self.x[:3]  # innovation
+        S = self.P[:3, :3] + self.meas_var * np.eye(3)
+        K = self.P[:, :3] @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        self.P = self.P - K @ self.P[:3, :]
+        self.height = 0.8 * self.height + 0.2 * float(m['height'])
+        self.n_cams = int(m.get('n_cams', 1))
+        self.hits += 1
+        self.t_updated = now
+
+
+class PersonTracker:
+    """SORT in 3D over fused person clusters: predict all tracks, match tracks
+    to measurements (Hungarian, gated), update matched, spawn tracks for
+    unmatched measurements, drop tracks unseen for max_age seconds. Tracks are
+    reported only after min_hits matches (kills one-frame false positives) and
+    keep coasting on prediction through detection dropouts."""
+
+    def __init__(self, meas_std=0.15, accel_std=2.0, gate=1.2, max_age=1.5, min_hits=3):
+        self.meas_std, self.accel_std = meas_std, accel_std
+        self.gate, self.max_age, self.min_hits = gate, max_age, min_hits
+        self.tracks = []
+        self.t_last = None
+        self._next_id = 1
+
+    def step(self, measurements, now):
+        """measurements: list of {'center': (3,), 'height': m, 'n_cams': int}.
+        Returns live tracks as dicts: id, center, vel, height, n_cams, matched."""
+        dt = 0.0 if self.t_last is None else min(max(now - self.t_last, 0.0), 0.5)
+        self.t_last = now
+        for tr in self.tracks:
+            tr.predict(dt)
+
+        pairs = []
+        if self.tracks and measurements:
+            cost = np.array([[float(np.linalg.norm(tr.x[:3] - m['center']))
+                              for m in measurements] for tr in self.tracks])
+            pairs = _assign(cost, self.gate)
+        for r, c in pairs:
+            self.tracks[r].update(measurements[c], now)
+        matched_m = {c for _, c in pairs}
+        for j, m in enumerate(measurements):
+            if j not in matched_m:
+                self.tracks.append(Track(self._next_id, m, now, self.meas_std, self.accel_std))
+                self._next_id += 1
+        self.tracks = [tr for tr in self.tracks if now - tr.t_updated < self.max_age]
+
+        return [dict(id=tr.id, center=tr.x[:3].copy(), vel=tr.x[3:].copy(),
+                     height=tr.height, n_cams=tr.n_cams, matched=(tr.t_updated == now))
+                for tr in self.tracks if tr.hits >= self.min_hits]
+
+
 # --- synthetic self-test: two cameras observe a wall, a transient blob is carved ---
 
 def _rot_y(deg):
@@ -158,4 +267,32 @@ if __name__ == '__main__':
                             (1, {'center': np.array([0.2, 0.0, 1.0])}),
                             (1, {'center': np.array([3.0, 0.0, 1.0])})])
     assert len(clusters) == 2 and len(clusters[0]) == 2, clusters
+
+    # tracker: two people walk opposite ways 1.5 m apart at 0.8 m/s, noisy
+    # measurements at 20 Hz; walker A's detections drop out for 0.6 s mid-walk —
+    # the track must coast through on its Kalman prediction, same ID throughout
+    tracker = PersonTracker()
+    ids = set()
+    coast_err = 0.0
+    for i in range(100):  # 5 s
+        tk = i * 0.05
+        pa = np.array([0.8 * tk - 2.0, 0.0, 0.9])
+        pb = np.array([-0.8 * tk + 2.0, 1.5, 0.9])
+        meas = [dict(center=pb + 0.08 * rng.standard_normal(3), height=1.8, n_cams=2)]
+        if not 2.0 < tk < 2.6:  # A's dropout window
+            meas.append(dict(center=pa + 0.08 * rng.standard_normal(3), height=1.7, n_cams=2))
+        tracks = tracker.step(meas, tk)
+        ids |= {tr['id'] for tr in tracks}
+        if 2.0 < tk < 2.6:
+            a = [tr for tr in tracks if abs(tr['center'][1]) < 0.7]  # A walks the y=0 line
+            assert a, f'track A died during dropout at t={tk:.2f}'
+            coast_err = max(coast_err, float(np.linalg.norm(a[0]['center'] - pa)))
+    a = [tr for tr in tracks if abs(tr['center'][1]) < 0.7][0]
+    final_err = float(np.linalg.norm(a['center'] - pa))
+    vel_err = abs(float(a['vel'][0]) - 0.8)
+    print(f'tracker: {len(ids)} IDs for 2 people | coast err {coast_err:.2f} m | '
+          f'final err {final_err:.2f} m | vel err {vel_err:.2f} m/s')
+    assert len(ids) == 2, f'expected 2 track IDs, got {sorted(ids)}'
+    assert coast_err < 0.6, f'prediction drifted {coast_err:.2f} m during dropout'
+    assert final_err < 0.3 and vel_err < 0.25
     print('self-test PASS')
