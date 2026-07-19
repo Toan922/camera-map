@@ -93,24 +93,52 @@ class TSDFGrid:
         return self.pts[m], self.color[m].astype(np.uint8)
 
 
-def fuse_people(dets, merge_dist=0.75):
+def fuse_people(dets, merge_dist=0.75, range_frac=0.08):
     """Cluster person detections across cameras by world-space proximity.
-    dets: iterable of (cam_id, {'center': (3,) world meters, ...}).
+    dets: iterable of (cam_id, {'center': (3,) world meters, 'range': meters
+    from that camera (optional), ...}). Two detections from the SAME camera
+    never merge (they are two people by construction).
+
+    Merging is done by repeatedly joining the globally closest eligible pair
+    of clusters (not a single order-dependent pass over `dets`): with a
+    single pass, an early detection can lock onto a mediocre match before a
+    much better one is seen later, and the result then depends on input
+    order — same-camera detections arrive together, so that order is
+    anything but random.
+
+    The distance budget also grows with how far the detections are from
+    their cameras (`range_frac` of the larger range, added to `merge_dist`).
+    Monocular depth is metric only up to a per-camera scale correction
+    (DEPTH_SCALE); any residual scale error is proportional to distance, so
+    a fixed-meters threshold alone is too tight for a person standing far
+    from the cameras and looser than it needs to be up close.
     Returns a list of clusters, each a list of (cam_id, det)."""
-    clusters = []
-    for cam, det in dets:
-        best, best_d = None, merge_dist
-        for cl in clusters:
-            if any(c == cam for c, _ in cl):
-                continue
-            mean = np.mean([d['center'] for _, d in cl], axis=0)
-            dist = float(np.linalg.norm(mean - det['center']))
-            if dist < best_d:
-                best, best_d = cl, dist
-        if best is not None:
-            best.append((cam, det))
-        else:
-            clusters.append([(cam, det)])
+    clusters = [[(cam, det)] for cam, det in dets]
+
+    def cluster_center_range(cl):
+        center = np.mean([d['center'] for _, d in cl], axis=0)
+        ranges = [d['range'] for _, d in cl if 'range' in d]
+        rng = max(ranges) if ranges else 0.0
+        return center, rng
+
+    while True:
+        best, best_d = None, None
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                ci, cj = clusters[i], clusters[j]
+                if any(a == b for a, _ in ci for b, _ in cj):
+                    continue  # share a camera -> never merge
+                ci_c, ci_r = cluster_center_range(ci)
+                cj_c, cj_r = cluster_center_range(cj)
+                budget = merge_dist + range_frac * max(ci_r, cj_r)
+                dist = float(np.linalg.norm(ci_c - cj_c))
+                if dist < budget and (best_d is None or dist < best_d):
+                    best, best_d = (i, j), dist
+        if best is None:
+            break
+        i, j = best
+        clusters[i] += clusters[j]
+        del clusters[j]
     return clusters
 
 

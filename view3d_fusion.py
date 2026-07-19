@@ -67,6 +67,8 @@ TRACK_COLORS = [(255, 90, 90), (90, 200, 255), (255, 210, 80), (150, 255, 130),
                 (230, 120, 255), (255, 150, 60), (120, 160, 255), (255, 240, 180)]  # per track ID
 DISPLAY_SCALE = 0.5  # camera images shown in the viewer at this scale (geometry unaffected)
 PERSON_MERGE_M = 0.75  # detections from different cameras closer than this = same person
+PERSON_MERGE_RANGE_FRAC = 0.08  # + this fraction of distance-from-camera, widening the
+                                # budget for far-away people (proportional depth-scale error)
 DET_MAX_AGE = 0.5  # s — a camera's detections older than this drop out of fusion
 MASK_PAD = 0.15  # person bbox padding (fraction) when masking depth for the map
 
@@ -194,7 +196,9 @@ class Worker(threading.Thread):
             self.people = len(people)
 
             # publish to the fusion thread: world-space detections + masked depth for the map
-            dets = [dict(center=c['R_w'] @ p[4] + c['t_w'], height=p[6]) for p in people]
+            # range (camera-frame depth) rides along so fuse_people can widen its merge
+            # budget for far-away people, where per-camera depth-scale error is largest
+            dets = [dict(center=c['R_w'] @ p[4] + c['t_w'], height=p[6], range=p[5]) for p in people]
             dmap = depth
             if people and not args.no_map:
                 dmap = depth.copy()  # 0 = "no data" to the TSDF, so people never enter the map
@@ -272,7 +276,8 @@ class FusionThread(threading.Thread):
                     dets += [(c['idx'], d) for d in ds]
             meas = [dict(center=np.mean([d['center'] for _, d in cl], axis=0),
                          height=max(d['height'] for _, d in cl), n_cams=len(cl))
-                    for cl in fuse_people(dets, merge_dist=PERSON_MERGE_M)]
+                    for cl in fuse_people(dets, merge_dist=PERSON_MERGE_M,
+                                         range_frac=PERSON_MERGE_RANGE_FRAC)]
             tracks = self.tracker.step(meas, now)
 
             centers, half_sizes, labels, colors = [], [], [], []
