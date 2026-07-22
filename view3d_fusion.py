@@ -5,12 +5,20 @@
 
 What's new over view3d_ultra.py (which just overlays per-camera views):
 
-- Persistent room map — every camera's depth is integrated over time into one
-  shared TSDF voxel grid (fusion.py). Hundreds of noisy monocular-depth frames
-  average into a single stable surface at world/map, each camera filling the
-  others' blind spots; it appears over the first ~10-20 s and keeps refining.
-  People are masked out of the depth before integration, and free-space carving
-  erases any residue, so the map is the *static* room only.
+- One merged live room cloud (world/points) — every camera reprojects its
+  current depth into world space and the fusion thread concatenates them into a
+  SINGLE point cloud (not one per camera): where the views overlap it densifies,
+  and each camera fills the others' blind spots. People are masked out (they get
+  their own cloud), so this is the live room only, in true color.
+- Persistent room map (world/map) — the same masked depth is also integrated
+  over time into one shared TSDF voxel grid (fusion.py). Hundreds of noisy
+  monocular-depth frames average into a single stable surface; free-space
+  carving erases residue; it appears over the first ~10-20 s and keeps refining.
+  The refined, denoised counterpart to the instant world/points cloud.
+- One fused person cloud (world/people/points) — the depth pixels inside each
+  detection's bbox are reprojected to world space in true color; both cameras'
+  views of the same person are merged into one cloud, so you see the person's
+  actual shape in space, not just a box.
 - Tracked people (SORT in 3D) — per-camera detections are transformed to world
   space, clustered across cameras (two detections from the same camera never
   merge), then fed to one constant-velocity Kalman filter per person with
@@ -20,10 +28,11 @@ What's new over view3d_ultra.py (which just overlays per-camera views):
   on its predicted path (dimmed, "predicted"). Per-camera raw boxes are off by
   default (--per-cam-boxes to debug association).
 
-Architecture: the per-camera workers are unchanged from view3d_ultra.py
-(capture -> depth -> detection -> live point cloud, one thread per camera);
-they additionally publish detections + masked depth to a fusion thread that
-owns the map and the fused people.
+Architecture: one worker thread per camera (capture -> depth -> detection),
+each publishing world-space room points, person clouds + detections, and masked
+depth to a single fusion thread that owns the merged cloud, the map, and the
+tracked people. --profile prints per-stage timings; --input-size / --capture
+trade depth detail for FPS.
 
 Each camera needs calibration/camera_<idx>.json from calibrate.py; multi-camera
 also needs "extrinsics" from extrinsics.py (that is what makes world space
@@ -60,8 +69,6 @@ INPUT_SIZE = 384
 MAX_DEPTH = 20.0
 DEPTH_SCALE = 0.71  # tape-measure correction, see test.py — per-camera override via
                     # a "depth_scale" key in calibration/camera_<idx>.json
-FADE_COLOR = np.array([168.0, 85.0, 247.0])  # live point cloud fades toward this (purple)
-FADE_STRENGTH = 0.85  # how tinted the farthest point gets (1.0 = solid purple, 0 = off)
 BOX_COLORS = [(80, 200, 255), (255, 170, 80), (170, 255, 120), (255, 120, 200)]  # per camera
 TRACK_COLORS = [(255, 90, 90), (90, 200, 255), (255, 210, 80), (150, 255, 130),
                 (230, 120, 255), (255, 150, 60), (120, 160, 255), (255, 240, 180)]  # per track ID
@@ -70,6 +77,7 @@ PERSON_MERGE_M = 0.75  # detections from different cameras closer than this = sa
 PERSON_MERGE_RANGE_FRAC = 0.08  # + this fraction of distance-from-camera, widening the
                                 # budget for far-away people (proportional depth-scale error)
 DET_MAX_AGE = 0.5  # s — a camera's detections older than this drop out of fusion
+CLOUD_MAX_AGE = 2.0  # s — a camera's room points older than this stop feeding the merged cloud
 MASK_PAD = 0.15  # person bbox padding (fraction) when masking depth for the map
 
 parser = argparse.ArgumentParser()
@@ -87,8 +95,18 @@ parser.add_argument('--per-cam-boxes', action='store_true',
                     help='also show per-camera person boxes (debug association)')
 parser.add_argument('--save', default=None, help='record to .rrd file instead of opening the viewer')
 parser.add_argument('--max-frames', type=int, default=0, help='stop after N frames per camera (0 = run forever)')
+parser.add_argument('--input-size', type=int, default=384,
+                    help='depth model input size (multiple of 14; lower = faster, coarser depth)')
+parser.add_argument('--capture', default='1920x1080',
+                    help='camera capture WxH; lower = faster, sparser (intrinsics rescale automatically)')
+parser.add_argument('--person-stride', type=int, default=3,
+                    help='pixel subsampling for the per-person point clouds (lower = denser)')
+parser.add_argument('--profile', action='store_true',
+                    help='print per-stage timings (depth/detect/rest ms) in the status line')
 args = parser.parse_args()
 cam_indices = [int(x) for x in args.cameras.split(',')]
+INPUT_SIZE = args.input_size
+cap_w, cap_h = (int(v) for v in args.capture.lower().split('x'))
 
 # --- depth model (shared: its forward pass is stateless, safe across threads) ---
 if DEVICE == 'cuda':
@@ -107,13 +125,14 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 
 
 def infer_depth(frame_bgr, model_size_hw):
     """model.infer_image with the resize/normalize moved onto the GPU — the numpy
-    preprocess costs ~19 ms per 1080p frame, this path ~2 ms. CUDA only; other
-    devices use the stock infer_image."""
-    if DEVICE != 'cuda':
+    preprocess costs ~19 ms per 1080p frame, this path ~2 ms. Runs on any GPU
+    (CUDA or Apple MPS); CPU falls back to the stock numpy infer_image."""
+    if DEVICE == 'cpu':
         return depth_model.infer_image(frame_bgr, input_size=INPUT_SIZE)
+    down_mode = 'bicubic' if DEVICE == 'cuda' else 'bilinear'  # MPS has no bicubic kernel
     x = torch.from_numpy(frame_bgr).to(DEVICE)
     x = x.flip(-1).permute(2, 0, 1)[None].float().div_(255)  # BGR uint8 -> RGB 0..1
-    x = TF.interpolate(x, size=model_size_hw, mode='bicubic', align_corners=False)
+    x = TF.interpolate(x, size=model_size_hw, mode=down_mode, align_corners=False)
     x = (x - IMAGENET_MEAN) / IMAGENET_STD
     with torch.no_grad():
         d = depth_model(x)
@@ -160,6 +179,7 @@ class Worker(threading.Thread):
         super().__init__(daemon=True)
         self.cam, self.yolo, self.color, self.stop = cam, yolo, color, stop
         self.fps, self.frames, self.people = 0.0, 0, 0
+        self.t_depth = self.t_det = self.t_rest = 0.0  # EMA per-stage ms (--profile)
 
     def run(self):
         c = self.cam
@@ -175,8 +195,11 @@ class Worker(threading.Thread):
                 time.sleep(0.001)
                 continue
 
+            t0 = time.perf_counter()
             depth = infer_depth(frame, c['model_size_hw']) * c['depth_scale']  # HxW meters
+            t1 = time.perf_counter()
             det = self.yolo(frame, classes=[0], device=DEVICE, verbose=False)[0]  # class 0 = person
+            t2 = time.perf_counter()
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             now = time.time()
 
@@ -195,16 +218,35 @@ class Worker(threading.Thread):
                 people.append((x1, y1, x2, y2, center, z_p, bh / c['fy'] * z_p))
             self.people = len(people)
 
-            # publish to the fusion thread: world-space detections + masked depth for the map
-            # range (camera-frame depth) rides along so fuse_people can widen its merge
-            # budget for far-away people, where per-camera depth-scale error is largest
-            dets = [dict(center=c['R_w'] @ p[4] + c['t_w'], height=p[6], range=p[5]) for p in people]
+            # Each detection carries its own world-space point cloud (the depth pixels
+            # inside its bbox, subsampled, in true color). The fusion thread merges the
+            # two cameras' clouds of the same person into one. A shared person_mask keeps
+            # people out of the room clouds (they get their own cloud instead).
+            H, W = depth.shape
+            person_mask = np.zeros((H, W), bool)
+            ps = args.person_stride
+            dets = []
+            for x1, y1, x2, y2, center_cam, z_p, height in people:
+                px, py = int((x2 - x1) * MASK_PAD), int((y2 - y1) * MASK_PAD)
+                person_mask[max(y1 - py, 0):y2 + py, max(x1 - px, 0):x2 + px] = True
+                x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, W), min(y2, H)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                sub_z = depth[y1:y2:ps, x1:x2:ps]
+                vv, uu = np.mgrid[y1:y2:ps, x1:x2:ps]
+                keep = sub_z > 0.05
+                zc = sub_z[keep]
+                cam_pts = np.stack([(uu[keep] - c['cx']) / c['fx'] * zc,
+                                    (vv[keep] - c['cy']) / c['fy'] * zc, zc], axis=-1)
+                dets.append(dict(center=c['R_w'] @ center_cam + c['t_w'], height=height, range=z_p,
+                                 points=(cam_pts @ c['R_w'].T + c['t_w']).astype(np.float32),
+                                 colors=rgb[y1:y2:ps, x1:x2:ps][keep]))
+
+            # masked depth for the persistent TSDF map (0 = "no data", so people never enter it)
             dmap = depth
             if people and not args.no_map:
-                dmap = depth.copy()  # 0 = "no data" to the TSDF, so people never enter the map
-                for x1, y1, x2, y2, *_ in people:
-                    px, py = int((x2 - x1) * MASK_PAD), int((y2 - y1) * MASK_PAD)
-                    dmap[max(y1 - py, 0):y2 + py, max(x1 - px, 0):x2 + px] = 0.0
+                dmap = depth.copy()
+                dmap[person_mask] = 0.0
             with c['lock']:
                 c['dets'] = (now, dets)
                 c['map_frame'] = (now, dmap, rgb)
@@ -214,16 +256,19 @@ class Worker(threading.Thread):
             rr.set_time('frame', sequence=self.frames)
             rr.set_time('time', timestamp=now)
 
-            # live point cloud in camera coords — the Transform3D on world/cam<idx> places it in the world
+            # this camera's contribution to the ONE merged room cloud: people masked out,
+            # invalid/zero-depth pixels dropped (so nothing piles up at the camera origin),
+            # reprojected into world space in true color. The fusion thread concatenates
+            # every camera's latest into a single world/points cloud — overlap densifies
+            # and each camera fills the others' blind spots.
             s = args.stride
             z = depth[::s, ::s]
-            pts = np.stack([c['xn'] * z, c['yn'] * z, z], axis=-1).reshape(-1, 3)
-            # distance fade: nearest point true color -> farthest most purple, rescaled
-            # per frame (percentiles, not min/max, so a few outlier pixels don't flicker it)
-            z_lo, z_hi = np.percentile(z, [2, 98])
-            fade = np.clip((z - z_lo) / max(z_hi - z_lo, 1e-6), 0, 1)[..., None] * FADE_STRENGTH
-            colors = (rgb[::s, ::s] * (1 - fade) + FADE_COLOR * fade).astype(np.uint8)
-            rr.log(f'{base}/points', rr.Points3D(pts, colors=colors.reshape(-1, 3), radii=0.01))
+            keep = (z > 0.05) & ~person_mask[::s, ::s]
+            zc = z[keep]
+            cam_pts = np.stack([c['xn'][keep] * zc, c['yn'][keep] * zc, zc], axis=-1)
+            with c['lock']:
+                c['room'] = (now, (cam_pts @ c['R_w'].T + c['t_w']).astype(np.float32),
+                             rgb[::s, ::s][keep])
 
             if args.per_cam_boxes:  # debug: this camera's own (unfused) boxes
                 centers, half_sizes, labels = [], [], []
@@ -241,6 +286,10 @@ class Worker(threading.Thread):
                    rr.EncodedImage(contents=cv2.imencode('.jpg', small)[1].tobytes(),
                                    media_type='image/jpeg'))
 
+            t3 = time.perf_counter()
+            self.t_depth = 0.9 * self.t_depth + 0.1 * (t1 - t0) * 1e3
+            self.t_det = 0.9 * self.t_det + 0.1 * (t2 - t1) * 1e3
+            self.t_rest = 0.9 * self.t_rest + 0.1 * (t3 - t2) * 1e3
             if t_prev is not None:
                 self.fps = 0.9 * self.fps + 0.1 * (1.0 / max(now - t_prev, 1e-6))
             t_prev = now
@@ -257,10 +306,11 @@ class FusionThread(threading.Thread):
         super().__init__(daemon=True)
         self.cams, self.grid, self.stop = cams, grid, stop
         self.tracker = PersonTracker(gate=PERSON_MERGE_M * 1.6)
-        self.n_people, self.n_map, self.ticks = 0, 0, 0
+        self.n_people, self.n_map, self.n_cloud, self.ticks = 0, 0, 0, 0
 
     def run(self):
         last_int = {c['idx']: 0.0 for c in self.cams}
+        room_t = {c['idx']: -1.0 for c in self.cams}
         last_log = 0.0
         while not self.stop.is_set():
             now = time.time()
@@ -274,11 +324,23 @@ class FusionThread(threading.Thread):
                     t_d, ds = c['dets']
                 if now - t_d < DET_MAX_AGE:
                     dets += [(c['idx'], d) for d in ds]
-            meas = [dict(center=np.mean([d['center'] for _, d in cl], axis=0),
-                         height=max(d['height'] for _, d in cl), n_cams=len(cl))
-                    for cl in fuse_people(dets, merge_dist=PERSON_MERGE_M,
-                                         range_frac=PERSON_MERGE_RANGE_FRAC)]
+            meas, ppts, pcols = [], [], []
+            for cl in fuse_people(dets, merge_dist=PERSON_MERGE_M, range_frac=PERSON_MERGE_RANGE_FRAC):
+                center = np.mean([d['center'] for _, d in cl], axis=0)
+                meas.append(dict(center=center, height=max(d['height'] for _, d in cl), n_cams=len(cl)))
+                # each camera reconstructs the person at a slightly different spot (per-camera
+                # monocular depth-scale error), so raw concatenation shows two offset copies.
+                # Shift each view so its centroid lands on the fused center -> they overlap.
+                for _, d in cl:
+                    if len(d['points']):
+                        ppts.append(d['points'] + (center - d['center']).astype(np.float32))
+                        pcols.append(d['colors'])
             tracks = self.tracker.step(meas, now)
+
+            # one fused, true-color point cloud of everyone — their actual shape in space
+            rr.log('world/people/points',
+                   rr.Points3D(np.concatenate(ppts) if ppts else np.zeros((0, 3), np.float32),
+                               colors=np.concatenate(pcols) if pcols else None, radii=0.015))
 
             centers, half_sizes, labels, colors = [], [], [], []
             arr_o, arr_v, arr_c = [], [], []
@@ -323,6 +385,23 @@ class FusionThread(threading.Thread):
                     self.n_map = len(pts)
                     last_log = now
 
+            # --- merged live room cloud: all cameras' latest world-space room points as
+            #     ONE cloud, re-logged only when a camera delivers a fresh frame ---
+            rpts, rcols, fresh = [], [], False
+            for c in self.cams:
+                with c['lock']:
+                    r = c['room']
+                if r is None or now - r[0] > CLOUD_MAX_AGE:
+                    continue
+                rpts.append(r[1])
+                rcols.append(r[2])
+                if r[0] != room_t[c['idx']]:
+                    room_t[c['idx']], fresh = r[0], True
+            if fresh:
+                rr.log('world/points',
+                       rr.Points3D(np.concatenate(rpts), colors=np.concatenate(rcols), radii=0.01))
+                self.n_cloud = sum(len(p) for p in rpts)
+
             self.ticks += 1
             time.sleep(0.05)
 
@@ -331,9 +410,10 @@ class FusionThread(threading.Thread):
 cams = []
 for idx in cam_indices:
     cap = cv2.VideoCapture(idx)
-    # Windows opens webcams at 640x480 by default; request full res to match calibration
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    # request the configured resolution (--capture); intrinsics rescale to whatever the
+    # camera actually delivers, so this trades detail for speed without breaking geometry
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cap_w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cap_h)
     ret, frame = cap.read()
     assert ret, f'no frame from camera {idx}'
     H, W = frame.shape[:2]
@@ -378,7 +458,7 @@ for idx in cam_indices:
         xn=(us - cx) / fx, yn=(vs - cy) / fy,  # normalized ray directions at stride
         R_w=np.array(extrinsics['R'], np.float32) if extrinsics else np.eye(3, dtype=np.float32),
         t_w=np.array(extrinsics['t'], np.float32) if extrinsics else np.zeros(3, np.float32),
-        lock=threading.Lock(), dets=(0.0, []), map_frame=None,
+        lock=threading.Lock(), dets=(0.0, []), map_frame=None, room=None,
     ))
 
 # --- rerun ---
@@ -434,8 +514,13 @@ fusion.start()
 try:
     while any(w.is_alive() for w in workers):
         time.sleep(2.0)
-        print(' | '.join(f'cam{w.cam["idx"]}: {w.fps:.1f} FPS, {w.people} det(s)' for w in workers)
-              + f' || fused: {fusion.n_people} person(s), map {fusion.n_map / 1000:.0f}k pts')
+        status = ' | '.join(f'cam{w.cam["idx"]}: {w.fps:.1f} FPS, {w.people} det(s)' for w in workers)
+        if args.profile:
+            status += '  ' + ' '.join(
+                f'[c{w.cam["idx"]} depth {w.t_depth:.0f} / det {w.t_det:.0f} / rest {w.t_rest:.0f} ms]'
+                for w in workers)
+        print(f'{status} || fused: {fusion.n_people} person(s), '
+              f'cloud {fusion.n_cloud / 1000:.0f}k + map {fusion.n_map / 1000:.0f}k pts')
 except KeyboardInterrupt:
     pass
 finally:
